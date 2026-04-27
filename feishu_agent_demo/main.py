@@ -46,10 +46,10 @@ class AgentOrchestrator:
         self.bitable_client = FeishuBitableClient(self.settings)
         
         # 初始化所有Agent
-        self.writer_agent = ContentWriterAgent(self.settings)
-        self.auditor_agent = ContentAuditAgent(self.settings)
-        self.publisher_agent = ContentPublisherAgent(self.settings)
-        self.analyst_agent = DataAnalysisAgent(self.settings)
+        self.writer_agent = ContentWriterAgent("agent_writer_01", self.settings)
+        self.auditor_agent = ContentAuditAgent("agent_auditor_01", self.settings)
+        self.publisher_agent = ContentPublisherAgent("agent_publisher_01", self.settings)
+        self.analyst_agent = DataAnalysisAgent("agent_analyst_01", self.settings)
         
         # 数据分析定时器，默认每天执行一次
         self.last_analysis_time = datetime.now() - timedelta(days=1)

@@ -92,19 +92,51 @@ class Settings:
 
     # 多维表格定位信息
     bitable_app_token: str
-    table_id: str
+    task_table_id: str  # 选题任务表ID
+    content_table_id: str  # 内容数据表ID
 
-    # 轮询与字段配置
+    # 轮询配置
     poll_interval_seconds: int
-    title_field_name: str
-    status_field_name: str
-    output_field_name: str
+
+    # 任务表字段配置
+    task_field_task_id: str
+    task_field_title: str
+    task_field_requirement: str
+    task_field_content_type: str
+    task_field_priority: str
+    task_field_status: str
+    task_field_creator_agent: str
+    task_field_auditor_agent: str
+    task_field_publisher_agent: str
+    task_field_created_at: str
+    task_field_deadline: str
+    task_field_final_score: str
+
+    # 内容表字段配置
+    content_field_content_id: str
+    content_field_task_id: str
+    content_field_writer_agent: str
+    content_field_content_text: str
+    content_field_audit_result: str
+    content_field_audit_comment: str
+    content_field_audit_time: str
+    content_field_publish_url: str
+    content_field_publish_time: str
+    content_field_view_count: str
+    content_field_quality_score: str
 
     # 业务状态配置
-    pending_status: str
-    processing_status: str
-    review_status: str
-    failed_status: str
+    task_status_pending_assign: str
+    task_status_pending_write: str
+    task_status_pending_audit: str
+    task_status_pending_publish: str
+    task_status_completed: str
+    task_status_rejected: str
+
+    # 审核结果配置
+    audit_result_pass: str
+    audit_result_reject: str
+    audit_result_modify_pass: str
 
     # 大模型配置
     use_mock_llm: bool
@@ -124,15 +156,50 @@ def load_settings() -> Settings:
         feishu_app_id=_get_required_env("FEISHU_APP_ID"),
         feishu_app_secret=_get_required_env("FEISHU_APP_SECRET"),
         bitable_app_token=_get_required_env("BITABLE_APP_TOKEN"),
-        table_id=_get_required_env("TABLE_ID"),
+        task_table_id=_get_required_env("TASK_TABLE_ID"),
+        content_table_id=_get_required_env("CONTENT_TABLE_ID"),
         poll_interval_seconds=_get_int_env("POLL_INTERVAL_SECONDS", default=10),
-        title_field_name=os.getenv("TITLE_FIELD_NAME", "任务标题").strip() or "任务标题",
-        status_field_name=os.getenv("STATUS_FIELD_NAME", "状态").strip() or "状态",
-        output_field_name=os.getenv("OUTPUT_FIELD_NAME", "输出结果").strip() or "输出结果",
-        pending_status=os.getenv("PENDING_STATUS", "待处理").strip() or "待处理",
-        processing_status=os.getenv("PROCESSING_STATUS", "处理中").strip() or "处理中",
-        review_status=os.getenv("REVIEW_STATUS", "待审核").strip() or "待审核",
-        failed_status=os.getenv("FAILED_STATUS", "处理失败").strip() or "处理失败",
+        
+        # 任务表字段配置
+        task_field_task_id=os.getenv("TASK_FIELD_TASK_ID", "task_id").strip() or "task_id",
+        task_field_title=os.getenv("TASK_FIELD_TITLE", "task_title").strip() or "task_title",
+        task_field_requirement=os.getenv("TASK_FIELD_REQUIREMENT", "task_requirement").strip() or "task_requirement",
+        task_field_content_type=os.getenv("TASK_FIELD_CONTENT_TYPE", "content_type").strip() or "content_type",
+        task_field_priority=os.getenv("TASK_FIELD_PRIORITY", "priority").strip() or "priority",
+        task_field_status=os.getenv("TASK_FIELD_STATUS", "task_status").strip() or "task_status",
+        task_field_creator_agent=os.getenv("TASK_FIELD_CREATOR_AGENT", "creator_agent").strip() or "creator_agent",
+        task_field_auditor_agent=os.getenv("TASK_FIELD_AUDITOR_AGENT", "auditor_agent").strip() or "auditor_agent",
+        task_field_publisher_agent=os.getenv("TASK_FIELD_PUBLISHER_AGENT", "publisher_agent").strip() or "publisher_agent",
+        task_field_created_at=os.getenv("TASK_FIELD_CREATED_AT", "created_at").strip() or "created_at",
+        task_field_deadline=os.getenv("TASK_FIELD_DEADLINE", "deadline").strip() or "deadline",
+        task_field_final_score=os.getenv("TASK_FIELD_FINAL_SCORE", "final_score").strip() or "final_score",
+        
+        # 内容表字段配置
+        content_field_content_id=os.getenv("CONTENT_FIELD_CONTENT_ID", "content_id").strip() or "content_id",
+        content_field_task_id=os.getenv("CONTENT_FIELD_TASK_ID", "task_id").strip() or "task_id",
+        content_field_writer_agent=os.getenv("CONTENT_FIELD_WRITER_AGENT", "writer_agent").strip() or "writer_agent",
+        content_field_content_text=os.getenv("CONTENT_FIELD_CONTENT_TEXT", "content_text").strip() or "content_text",
+        content_field_audit_result=os.getenv("CONTENT_FIELD_AUDIT_RESULT", "audit_result").strip() or "audit_result",
+        content_field_audit_comment=os.getenv("CONTENT_FIELD_AUDIT_COMMENT", "audit_comment").strip() or "audit_comment",
+        content_field_audit_time=os.getenv("CONTENT_FIELD_AUDIT_TIME", "audit_time").strip() or "audit_time",
+        content_field_publish_url=os.getenv("CONTENT_FIELD_PUBLISH_URL", "publish_url").strip() or "publish_url",
+        content_field_publish_time=os.getenv("CONTENT_FIELD_PUBLISH_TIME", "publish_time").strip() or "publish_time",
+        content_field_view_count=os.getenv("CONTENT_FIELD_VIEW_COUNT", "view_count").strip() or "view_count",
+        content_field_quality_score=os.getenv("CONTENT_FIELD_QUALITY_SCORE", "quality_score").strip() or "quality_score",
+        
+        # 业务状态配置
+        task_status_pending_assign=os.getenv("TASK_STATUS_PENDING_ASSIGN", "待分配").strip() or "待分配",
+        task_status_pending_write=os.getenv("TASK_STATUS_PENDING_WRITE", "待创作").strip() or "待创作",
+        task_status_pending_audit=os.getenv("TASK_STATUS_PENDING_AUDIT", "待审核").strip() or "待审核",
+        task_status_pending_publish=os.getenv("TASK_STATUS_PENDING_PUBLISH", "待发布").strip() or "待发布",
+        task_status_completed=os.getenv("TASK_STATUS_COMPLETED", "已完成").strip() or "已完成",
+        task_status_rejected=os.getenv("TASK_STATUS_REJECTED", "已驳回").strip() or "已驳回",
+        
+        # 审核结果配置
+        audit_result_pass=os.getenv("AUDIT_RESULT_PASS", "通过").strip() or "通过",
+        audit_result_reject=os.getenv("AUDIT_RESULT_REJECT", "驳回").strip() or "驳回",
+        audit_result_modify_pass=os.getenv("AUDIT_RESULT_MODIFY_PASS", "修改后通过").strip() or "修改后通过",
+        
         use_mock_llm=_get_bool_env("USE_MOCK_LLM", default=True),
         llm_api_url=os.getenv("LLM_API_URL", "").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),

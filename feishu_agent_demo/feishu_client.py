@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import lark_oapi as lark
 
@@ -34,10 +34,9 @@ class FeishuBitableClient:
     飞书多维表格客户端封装。
 
     这里对外暴露简单的方法，例如：
-    - 获取待处理任务
-    - 更新任务状态和结果
-
-    调用方无需了解底层 SDK 的 Request Builder 细节。
+    - 获取不同状态的任务
+    - 创建/更新任务记录
+    - 创建/更新内容记录
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -68,13 +67,28 @@ class FeishuBitableClient:
             return
 
         log_id = response.get_log_id()
-        troubleshooter = response.get_troubleshooter()
+        code = response.code
+        msg = response.msg
+        
+        # 兼容不同版本SDK的错误格式
+        try:
+            troubleshooter = response.get_troubleshooter()
+        except (AttributeError, TypeError):
+            # 如果获取失败，手动从error中提取
+            troubleshooter = ""
+            if hasattr(response, 'error'):
+                error = response.error
+                if isinstance(error, dict):
+                    troubleshooter = error.get('troubleshooter', '')
+                else:
+                    troubleshooter = getattr(error, 'troubleshooter', '')
+
         error_message = (
-            f"{action}失败，code={response.code}，msg={response.msg}，"
+            f"{action}失败，code={code}，msg={msg}，"
             f"log_id={log_id}，troubleshooter={troubleshooter}"
         )
 
-        if response.code == 91403:
+        if code == 91403:
             raise FeishuPermissionDeniedError(
                 f"{error_message}。"
                 "这通常表示应用缺少当前多维表格的文档权限。"
@@ -85,72 +99,49 @@ class FeishuBitableClient:
 
         raise FeishuApiError(error_message)
 
-    def _build_pending_filter(self) -> str:
+    def _extract_text_value(self, value: Any) -> str:
+        """提取字段的文本值，处理飞书多维表格不同字段类型的返回格式"""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list) and value:
+            return str(value[0])
+        if isinstance(value, dict) and "text" in value:
+            return str(value["text"])
+        return str(value) if value is not None else ""
+
+    def get_tasks_by_status(self, status: str) -> List[Dict[str, Any]]:
         """
-        构造默认筛选条件。
-
-        飞书多维表格的 filter 语法支持按照字段值过滤。
-        这里默认只取“状态 = 待处理”的记录。
+        根据状态获取任务表中的记录
         """
-        return (
-            f'CurrentValue.[{self.settings.status_field_name}] = '
-            f'"{self.settings.pending_status}"'
-        )
+        filter_formula = f'CurrentValue.[{self.settings.task_field_status}] = "{status}"'
+        page_token: Optional[str] = None
+        tasks: List[Dict[str, Any]] = []
 
-    def get_pending_tasks(self, filter_formula: str | None = None) -> list[dict[str, Any]]:
-        """
-        拉取所有“待处理”任务。
-
-        参数：
-        - filter_formula：可选，自定义飞书 filter 语法。
-          如果不传，则默认查询“状态 = 待处理”。
-
-        返回值：
-        - 一个列表，列表中的每一项都是一个任务字典，包含 record_id、fields、title 等信息。
-        """
-        effective_filter = filter_formula or self._build_pending_filter()
-        page_token: str | None = None
-        tasks: list[dict[str, Any]] = []
-
-        self.logger.info("开始从多维表格拉取待处理任务，filter=%s", effective_filter)
+        self.logger.info(f"拉取状态为[{status}]的任务，filter={filter_formula}")
 
         while True:
-            # 使用 Builder 构造“列出记录”请求。
             request_builder = (
                 lark.bitable.v1.ListAppTableRecordRequest.builder()
                 .app_token(self.settings.bitable_app_token)
-                .table_id(self.settings.table_id)
-                .filter(effective_filter)
+                .table_id(self.settings.task_table_id)
+                .filter(filter_formula)
                 .page_size(100)
             )
 
-            # 如果上一页返回了 page_token，则继续翻页拉取。
             if page_token:
                 request_builder = request_builder.page_token(page_token)
 
             request = request_builder.build()
-
-            # 调用官方 SDK 的 list 接口获取记录。
             response = self.client.bitable.v1.app_table_record.list(request)
-            self._raise_if_failed(response, action="列出多维表格记录")
+            self._raise_if_failed(response, action="获取任务记录")
 
-            # 飞书返回的数据主体在 response.data 里。
             items = response.data.items if response.data and response.data.items else []
 
             for item in items:
                 fields = item.fields or {}
                 task = {
                     "record_id": item.record_id,
-                    "fields": fields,
-                    "title": self._extract_text_value(
-                        fields.get(self.settings.title_field_name)
-                    ),
-                    "status": self._extract_text_value(
-                        fields.get(self.settings.status_field_name)
-                    ),
-                    "output_result": self._extract_text_value(
-                        fields.get(self.settings.output_field_name)
-                    ),
+                    **fields,
                 }
                 tasks.append(task)
 
@@ -160,62 +151,158 @@ class FeishuBitableClient:
             if not has_more:
                 break
 
-        self.logger.info("待处理任务拉取完成，共获取到 %s 条记录。", len(tasks))
+        self.logger.info(f"拉取完成，共获取到 {len(tasks)} 条记录")
         return tasks
 
-    def update_task_status_and_result(self, record_id: str, status: str, result: str) -> None:
+    def update_task_fields(self, record_id: str, fields: Dict[str, Any]) -> None:
         """
-        更新指定记录的状态和输出结果。
-
-        参数：
-        - record_id：飞书多维表格记录 ID
-        - status：要写入“状态”字段的值，例如“处理中”或“待审核”
-        - result：要写入“输出结果”字段的文本内容
+        更新任务表中指定记录的字段
         """
-        fields_to_update = {
-            self.settings.status_field_name: status,
-            self.settings.output_field_name: result,
-        }
+        record_body = lark.bitable.v1.AppTableRecord.builder().fields(fields).build()
 
-        # 构造记录对象，fields 中传入“字段名 -> 字段值”的映射。
-        record_body = lark.bitable.v1.AppTableRecord.builder().fields(fields_to_update).build()
-
-        # 构造“更新记录”请求。
         request = (
             lark.bitable.v1.UpdateAppTableRecordRequest.builder()
             .app_token(self.settings.bitable_app_token)
-            .table_id(self.settings.table_id)
+            .table_id(self.settings.task_table_id)
             .record_id(record_id)
             .request_body(record_body)
             .build()
         )
 
         response = self.client.bitable.v1.app_table_record.update(request)
-        self._raise_if_failed(response, action=f"更新记录 {record_id}")
+        self._raise_if_failed(response, action=f"更新任务记录 {record_id}")
 
-        self.logger.info(
-            "记录写回成功，record_id=%s，status=%s",
-            record_id,
-            status,
+        self.logger.info(f"任务记录更新成功，record_id={record_id}")
+
+    def create_content_record(self, fields: Dict[str, Any]) -> str:
+        """
+        在内容表中创建新记录
+        返回新创建记录的record_id
+        """
+        record_body = lark.bitable.v1.AppTableRecord.builder().fields(fields).build()
+
+        request = (
+            lark.bitable.v1.CreateAppTableRecordRequest.builder()
+            .app_token(self.settings.bitable_app_token)
+            .table_id(self.settings.content_table_id)
+            .request_body(record_body)
+            .build()
         )
 
-    @staticmethod
-    def _extract_text_value(value: Any) -> str:
+        response = self.client.bitable.v1.app_table_record.create(request)
+        self._raise_if_failed(response, action="创建内容记录")
+
+        record_id = response.data.record.record_id
+        self.logger.info(f"内容记录创建成功，record_id={record_id}")
+        return record_id
+
+    def get_content_by_task_id(self, task_id: str) -> Optional[Dict[str, Any]]:
         """
-        尽量把飞书返回的字段值安全地转成字符串。
-
-        多维表格不同字段类型的返回结构可能不同：
-        - 纯文本字段通常直接返回字符串；
-        - 有些字段可能返回列表；
-        - 也可能出现 None。
+        根据任务ID查询对应的内容记录
         """
-        if value is None:
-            return ""
+        filter_formula = f'CurrentValue.[{self.settings.content_field_task_id}] = "{task_id}"'
+        
+        request = (
+            lark.bitable.v1.ListAppTableRecordRequest.builder()
+            .app_token(self.settings.bitable_app_token)
+            .table_id(self.settings.content_table_id)
+            .filter(filter_formula)
+            .page_size(1)
+            .build()
+        )
 
-        if isinstance(value, str):
-            return value
+        response = self.client.bitable.v1.app_table_record.list(request)
+        self._raise_if_failed(response, action="查询内容记录")
 
-        if isinstance(value, list):
-            return ", ".join(str(item) for item in value)
+        items = response.data.items if response.data and response.data.items else []
+        if items:
+            item = items[0]
+            return {
+                "record_id": item.record_id,
+                **item.fields,
+            }
+        return None
 
-        return str(value)
+    def update_content_record(self, record_id: str, fields: Dict[str, Any]) -> None:
+        """
+        更新内容表中指定记录的字段
+        """
+        record_body = lark.bitable.v1.AppTableRecord.builder().fields(fields).build()
+
+        request = (
+            lark.bitable.v1.UpdateAppTableRecordRequest.builder()
+            .app_token(self.settings.bitable_app_token)
+            .table_id(self.settings.content_table_id)
+            .record_id(record_id)
+            .request_body(record_body)
+            .build()
+        )
+
+        response = self.client.bitable.v1.app_table_record.update(request)
+        self._raise_if_failed(response, action=f"更新内容记录 {record_id}")
+
+        self.logger.info(f"内容记录更新成功，record_id={record_id}")
+
+    def get_all_tasks(self) -> List[Dict[str, Any]]:
+        """获取所有任务记录，用于数据分析"""
+        page_token: Optional[str] = None
+        tasks: List[Dict[str, Any]] = []
+
+        while True:
+            request_builder = (
+                lark.bitable.v1.ListAppTableRecordRequest.builder()
+                .app_token(self.settings.bitable_app_token)
+                .table_id(self.settings.task_table_id)
+                .page_size(100)
+            )
+
+            if page_token:
+                request_builder = request_builder.page_token(page_token)
+
+            request = request_builder.build()
+            response = self.client.bitable.v1.app_table_record.list(request)
+            self._raise_if_failed(response, action="获取所有任务记录")
+
+            items = response.data.items if response.data and response.data.items else []
+            for item in items:
+                tasks.append({"record_id": item.record_id, **item.fields})
+
+            has_more = bool(response.data and response.data.has_more)
+            page_token = response.data.page_token if response.data else None
+
+            if not has_more:
+                break
+
+        return tasks
+
+    def get_all_contents(self) -> List[Dict[str, Any]]:
+        """获取所有内容记录，用于数据分析"""
+        page_token: Optional[str] = None
+        contents: List[Dict[str, Any]] = []
+
+        while True:
+            request_builder = (
+                lark.bitable.v1.ListAppTableRecordRequest.builder()
+                .app_token(self.settings.bitable_app_token)
+                .table_id(self.settings.content_table_id)
+                .page_size(100)
+            )
+
+            if page_token:
+                request_builder = request_builder.page_token(page_token)
+
+            request = request_builder.build()
+            response = self.client.bitable.v1.app_table_record.list(request)
+            self._raise_if_failed(response, action="获取所有内容记录")
+
+            items = response.data.items if response.data and response.data.items else []
+            for item in items:
+                contents.append({"record_id": item.record_id, **item.fields})
+
+            has_more = bool(response.data and response.data.has_more)
+            page_token = response.data.page_token if response.data else None
+
+            if not has_more:
+                break
+
+        return contents

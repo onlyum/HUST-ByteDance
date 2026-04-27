@@ -1,0 +1,49 @@
+# 敏感配置文件（包含密码、API密钥等）
+.env
+.env.local
+.env.*.local
+App.md
+app.md
+*.key
+*.pem
+*.secret
+
+# Python运行时文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py,cover
+.pytest_cache/
+.coverage
+.tox/
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+env/
+
+# 日志文件
+*.log
+logs/
+
+# IDE配置文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
+*.bak

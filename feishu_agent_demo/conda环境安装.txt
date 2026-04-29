@@ -1,0 +1,11 @@
+# 1. 创建名为 feishu_agent 的环境，并安装 Python 3.11.15
+conda create -n feishu_agent python=3.11.15 -y
+
+# 2. 激活这个环境
+conda activate feishu_agent
+
+# 3. 此时你的命令行前面会变成 (feishu_agent)，进入你的项目目录
+cd /d D:\Projects\ByteDance\feishu_agent_demo
+
+# 4. 安装项目依赖
+pip install -r requirements.txt

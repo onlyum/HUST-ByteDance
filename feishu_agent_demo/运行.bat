@@ -2,32 +2,38 @@
 setlocal
 chcp 65001 > nul
 
+:: 始终切换到本 bat 所在目录（feishu_agent_demo），保证能读到同目录下的 .env
+cd /d "%~dp0"
+
 echo ====================================================
-echo   飞书多维表格 Agent 启动器 (Conda 驱动版)
+echo   采购多 Agent 启动器（飞书 Bitable + WS）
 echo ====================================================
 
-:: 1. 检查 Conda 是否可用
-conda --version >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] 未检测到 Conda 命令！请确认是否已将 Conda 正确添加到环境变量。
-    pause
-    exit /b
-)
-
-:: 2. 激活 Conda 环境
-echo [INFO] 正在激活 Conda 虚拟环境: feishu_agent ...
-call conda activate feishu_agent
-
-:: 3. 检查 .env 文件
 if not exist ".env" (
-    echo [WARNING] 未发现 .env 配置文件，请确保已配置 API 凭证！
+    echo [WARNING] 当前目录下没有 .env，请复制 .env.example 为 .env 并填写凭证。
 )
 
-:: 4. 启动主程序
-echo [START] 正在启动 Agent 主程序 (main.py)...
+echo [START] 启动 main.py ...
 echo ----------------------------------------------------
-python main.py
 
+:: 优先使用 Conda 环境 feishu_agent（若已配置）
+where conda >nul 2>&1
+if not errorlevel 1 (
+    call conda activate feishu_agent 2>nul
+    if not errorlevel 1 (
+        python main.py
+        goto :done
+    )
+)
+
+:: 否则使用 PATH 中的 Python（适用于 venv：先手动 activate 再双击本脚本，或改用命令行）
+python main.py
+if errorlevel 1 (
+    echo.
+    echo [HINT] 若提示找不到 python，请先: python -m venv .venv ^&^& .venv\Scripts\activate ^&^& pip install -r requirements.txt
+)
+
+:done
 echo ----------------------------------------------------
-echo [END] 程序已停止运行。
+echo [END] 程序已退出。
 pause

@@ -2,7 +2,7 @@
 配置加载模块（采购供应链版）。
 
 - 保留：从 .env 读取飞书凭证 / Bitable 定位 / LLM 配置。
-- 新增：BusinessStatus / TABLE_IDS（你已拿到 tblID，直接绑定）。
+- BusinessStatus；TABLE_IDS 中核心四表从环境变量读取（见 .env.example）。
 """
 
 from __future__ import annotations
@@ -73,16 +73,29 @@ def _get_bool_env(name: str, default: bool) -> bool:
 
 class BusinessStatus:
     DEMAND_PENDING = "待规划"
+    DEMAND_PENDING_DEBATE = "待辩论"
+    # 单阶段审批（MULTI_STAGE_APPROVAL=false）仍用「待审批」一张卡完成下单
+    DEMAND_PENDING_APPROVAL = "待审批"
+    # 多阶段：主管 → 运输 → 采购确认下单（需在多维表格 status 单选中增加这些选项）
+    DEMAND_PENDING_APPROVAL_SUPERVISOR = "待主管审批"
+    DEMAND_PENDING_APPROVAL_LOGISTICS = "待运输审批"
+    # 采购部寻源后、发运前：采购在卡片中确认并持有供方/需求方对接信息（原「待下单确认」可逐步迁移为此状态）
+    DEMAND_PENDING_PURCHASE_CONFIRM = "待采购确认"
     SUPPLIER_SELECTED = "已选型"
     ORDER_PLACED = "已下单"
+    DEMAND_REJECTED = "已驳回"
     LOGISTICS_ABNORMAL = "异常"
 
 
 TABLE_IDS = {
-    "demands": "tblttFySYyrRGgrV",
-    "suppliers": "tblPHfNK7UejrktF",
-    "orders": "tblIeEj0nwODLH8o",
-    "logs": "tblB0ulWocd4vrgF",
+    "demands": _get_required_env("TABLE_ID_DEMANDS"),
+    "suppliers": _get_required_env("TABLE_ID_SUPPLIERS"),
+    "orders": _get_required_env("TABLE_ID_ORDERS"),
+    "logs": _get_required_env("TABLE_ID_LOGS"),
+    "personnel": os.getenv("TABLE_ID_PERSONNEL", "").strip(),
+    "debate_history": os.getenv("TABLE_ID_DEBATE_HISTORY", "").strip(),
+    "business_rules": os.getenv("TABLE_ID_BUSINESS_RULES", "").strip(),
+    "interaction_memory": os.getenv("TABLE_ID_INTERACTION_MEMORY", "").strip(),
 }
 
 
@@ -97,6 +110,10 @@ class ProcurementSettings:
 
     # 编排参数
     poll_interval_seconds: int
+    # 为 True 时，主循环每轮对「待辩论」自动跑 run_audit_debate（每轮最多 1 条），无需 IM「触发审批」
+    auto_run_audit_debate: bool
+    # 为 True：审批链为 待主管审批→待采购确认→待运输审批→建单；为 False：单卡「待审批」一键同意即下单
+    multi_stage_approval: bool
 
     # 采购域字段名（与 Bitable 列名保持一致）
     demand_field_status: str
@@ -104,18 +121,36 @@ class ProcurementSettings:
     demand_field_recommended_suppliers: str
     demand_field_budget_amount: str
     demand_field_category: str
+    demand_field_demand_code: str
+    demand_field_item_name: str
+    demand_field_spec: str
+    demand_field_quantity: str
+    demand_field_uom: str
+    demand_field_department: str
+    demand_field_requester: str
+    demand_field_currency: str
+    demand_field_need_by_date: str
+    demand_field_priority: str
+    # 新建需求时业务编号前缀，如 DEM、DLM（生成示例 DEM-20260506-143052-0427）
+    demand_code_prefix: str
 
     order_field_logistics_status: str
     order_field_expected_delivery_date: str
     order_field_demand: str
     order_field_supplier: str
 
+    # 审批：未在 Personnel 表匹配到负责人时回退的 open_id（可选）
+    mock_personnel_feishu_open_id: str
+
     # 大模型配置
     use_mock_llm: bool
     llm_api_url: str
     llm_api_key: str
     llm_model: str
+    llm_connect_timeout_seconds: int
     llm_timeout_seconds: int
+    # 为 True 时在请求体中加入 response_format=json_object（OpenAI 兼容 / 部分 Ark 网关支持）
+    llm_json_mode: bool
 
 
 def load_settings() -> ProcurementSettings:
@@ -124,6 +159,8 @@ def load_settings() -> ProcurementSettings:
         feishu_app_secret=_get_required_env("FEISHU_APP_SECRET"),
         bitable_app_token=_get_required_env("BITABLE_APP_TOKEN"),
         poll_interval_seconds=_get_int_env("POLL_INTERVAL_SECONDS", default=10),
+        auto_run_audit_debate=_get_bool_env("AUTO_RUN_AUDIT_DEBATE", default=True),
+        multi_stage_approval=_get_bool_env("MULTI_STAGE_APPROVAL", default=False),
 
         # Demands
         demand_field_status=os.getenv("DEMAND_FIELD_STATUS", "status").strip() or "status",
@@ -131,6 +168,17 @@ def load_settings() -> ProcurementSettings:
         demand_field_recommended_suppliers=os.getenv("DEMAND_FIELD_RECOMMENDED_SUPPLIERS", "recommended_suppliers").strip() or "recommended_suppliers",
         demand_field_budget_amount=os.getenv("DEMAND_FIELD_BUDGET_AMOUNT", "budget_amount").strip() or "budget_amount",
         demand_field_category=os.getenv("DEMAND_FIELD_CATEGORY", "category").strip() or "category",
+        demand_field_demand_code=os.getenv("DEMAND_FIELD_DEMAND_CODE", "demand_code").strip() or "demand_code",
+        demand_field_item_name=os.getenv("DEMAND_FIELD_ITEM_NAME", "item_name").strip() or "item_name",
+        demand_field_spec=os.getenv("DEMAND_FIELD_SPEC", "spec").strip() or "spec",
+        demand_field_quantity=os.getenv("DEMAND_FIELD_QUANTITY", "quantity").strip() or "quantity",
+        demand_field_uom=os.getenv("DEMAND_FIELD_UOM", "uom").strip() or "uom",
+        demand_field_department=os.getenv("DEMAND_FIELD_DEPARTMENT", "department").strip() or "department",
+        demand_field_requester=os.getenv("DEMAND_FIELD_REQUESTER", "requester").strip() or "requester",
+        demand_field_currency=os.getenv("DEMAND_FIELD_CURRENCY", "currency").strip() or "currency",
+        demand_field_need_by_date=os.getenv("DEMAND_FIELD_NEED_BY_DATE", "need_by_date").strip() or "need_by_date",
+        demand_field_priority=os.getenv("DEMAND_FIELD_PRIORITY", "priority").strip() or "priority",
+        demand_code_prefix=os.getenv("DEMAND_CODE_PREFIX", "DEM").strip() or "DEM",
 
         # Orders
         order_field_logistics_status=os.getenv("ORDER_FIELD_LOGISTICS_STATUS", "logistics_status").strip() or "logistics_status",
@@ -138,9 +186,13 @@ def load_settings() -> ProcurementSettings:
         order_field_demand=os.getenv("ORDER_FIELD_DEMAND", "demand").strip() or "demand",
         order_field_supplier=os.getenv("ORDER_FIELD_SUPPLIER", "supplier").strip() or "supplier",
 
+        mock_personnel_feishu_open_id=os.getenv("MOCK_PERSONNEL_FEISHU_OPEN_ID", "").strip(),
+
         use_mock_llm=_get_bool_env("USE_MOCK_LLM", default=True),
         llm_api_url=os.getenv("LLM_API_URL", "").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
         llm_model=os.getenv("LLM_MODEL", "mock-model").strip() or "mock-model",
-        llm_timeout_seconds=_get_int_env("LLM_TIMEOUT_SECONDS", default=30),
+        llm_connect_timeout_seconds=_get_int_env("LLM_CONNECT_TIMEOUT_SECONDS", default=10),
+        llm_timeout_seconds=_get_int_env("LLM_TIMEOUT_SECONDS", default=120),
+        llm_json_mode=_get_bool_env("LLM_JSON_MODE", default=False),
     )

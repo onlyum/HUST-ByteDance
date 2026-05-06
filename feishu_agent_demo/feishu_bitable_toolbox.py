@@ -175,6 +175,12 @@ class FeishuBitableToolbox:
                 )
 
             if isinstance(data, dict) and data.get("code", 0) != 0:
+                # 飞书偶发内部错误（如 1255001）按瞬时故障处理，走退避重试。
+                err_code = int(data.get("code", 0) or 0)
+                transient_codes = {1255001}
+                if err_code in transient_codes and attempt < retries:
+                    self._sleep_backoff(attempt=attempt, retry_after_seconds=None)
+                    continue
                 raise FeishuHttpError(
                     f"Feishu OpenAPI error: code={data.get('code')} msg={data.get('msg')}",
                     status_code=resp.status_code,
@@ -475,4 +481,26 @@ class FeishuBitableToolbox:
                 return
             if not has_more or not page_token:
                 return
+
+    def get_records(
+        self,
+        *,
+        app_token: str,
+        table_id: str,
+        page_size: int = 100,
+        fields: Optional[Sequence[str]] = None,
+        filter_formula: Optional[str] = None,
+        max_pages: int = 20,
+    ) -> List[Json]:
+        """分页拉取表记录并合并为列表（默认最多 max_pages 页）。"""
+        return list(
+            self.iter_records(
+                app_token=app_token,
+                table_id=table_id,
+                page_size=page_size,
+                fields=fields,
+                filter_formula=filter_formula,
+                max_pages=max_pages,
+            )
+        )
 

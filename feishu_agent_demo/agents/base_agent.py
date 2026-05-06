@@ -9,9 +9,28 @@ Agent基类模块（供应链版）
 import json
 import logging
 import time
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+# tenacity before_sleep 无 self，单独 logger
+_llm_retry_logger = logging.getLogger(f"{__name__}.llm_retry")
+
+
+def _before_llm_http_sleep(retry_state: object) -> None:
+    """超时/连接失败后、指数退避等待前打一条日志。"""
+    try:
+        exc = retry_state.outcome.exception()  # type: ignore[union-attr]
+        na = retry_state.next_action  # type: ignore[union-attr]
+        sleep_s = float(getattr(na, "sleep", 0) or 0)
+    except Exception:
+        exc, sleep_s = None, 0.0
+    _llm_retry_logger.warning(
+        "LLM HTTP 失败，约 %.0fs 后自动重试（tenacity：含首次最多 3 次请求）: %s",
+        sleep_s,
+        exc,
+    )
 
 from config import TABLE_IDS, BusinessStatus, ProcurementSettings
 from feishu_bitable_toolbox import FeishuBitableToolbox
@@ -154,55 +173,100 @@ class BaseAgent:
             },
         }
 
-    def _call_llm(self, prompt: str, system_prompt: str = None) -> str:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(
+            (
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            )
+        ),
+        before_sleep=_before_llm_http_sleep,
+        reraise=True,
+    )
+    def _llm_http_post_json(self, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
+        """HTTP 调用；连接超时 + 读超时；超时/连接错误由 tenacity 重试。"""
+        timeout = (self.settings.llm_connect_timeout_seconds, self.settings.llm_timeout_seconds)
+        self.logger.info(
+            "LLM HTTP: 发起 POST（connect=%ss read=%ss）%s",
+            timeout[0],
+            timeout[1],
+            f" → {self.settings.llm_api_url[:56]}…" if len(self.settings.llm_api_url) > 56 else f" → {self.settings.llm_api_url}",
+        )
+        response = requests.post(
+            self.settings.llm_api_url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("LLM response is not a JSON object")
+        return body
+
+    def _call_llm(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        *,
+        http_fail_use_mock: bool = True,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        response_format_json_object: bool = False,
+    ) -> str:
         """
-        统一调用大模型接口
-        :param prompt: 用户prompt
-        :param system_prompt: 系统prompt，可选
-        :return: 大模型返回结果
+        统一调用大模型接口。
+        :param http_fail_use_mock: 为 False 时，重试后仍失败则抛出异常，由业务层降级。
         """
         if self.use_mock:
             return self._mock_llm_response(prompt)
-        
+
         headers = {
             "Authorization": f"Bearer {self.settings.llm_api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        
-        messages = []
+
+        messages: List[Dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
-        
-        payload = {
+
+        payload: Dict[str, Any] = {
             "model": self.settings.llm_model,
             "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 2000
+            "temperature": 0.7 if temperature is None else float(temperature),
+            "max_tokens": 2000 if max_tokens is None else int(max_tokens),
         }
-        
+        if response_format_json_object and getattr(self.settings, "llm_json_mode", False):
+            payload["response_format"] = {"type": "json_object"}
+
         try:
-            self.logger.info(f"开始调用大模型，prompt长度: {len(prompt)}")
-            start_time = time.time()
-            
-            response = requests.post(
-                self.settings.llm_api_url,
-                headers=headers,
-                json=payload,
-                timeout=self.settings.llm_timeout_seconds
+            self.logger.info(
+                "开始调用大模型，prompt长度: %s（读超时 %ss；连接/读超时类错误自动重试：共最多 3 次请求，即失败后最多再试 2 次）",
+                len(prompt),
+                self.settings.llm_timeout_seconds,
             )
-            response.raise_for_status()
-            result = response.json()
-            
+            start_time = time.time()
+            result = self._llm_http_post_json(headers, payload)
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise ValueError("LLM response missing choices")
+            msg0 = choices[0].get("message") if isinstance(choices[0], dict) else None
+            content = msg0.get("content") if isinstance(msg0, dict) else None
+            if not isinstance(content, str):
+                content = str(content or "")
             elapsed = time.time() - start_time
-            self.logger.info(f"大模型调用完成，耗时: {elapsed:.2f}s")
-            
-            return result["choices"][0]["message"]["content"].strip()
-            
+            self.logger.info("大模型调用完成，耗时: %.2fs", elapsed)
+            return content.strip()
         except Exception as e:
-            self.logger.error(f"调用大模型失败：{str(e)}")
-            # 调用失败时降级使用Mock
-            return self._mock_llm_response(prompt)
+            self.logger.error("调用大模型失败：%s", e)
+            if http_fail_use_mock:
+                return self._mock_llm_response(prompt)
+            raise
 
     def _mock_llm_response(self, prompt: str) -> str:
         """

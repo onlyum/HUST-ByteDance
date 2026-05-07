@@ -50,24 +50,32 @@ class BotHandler:
             return "C"
 
         system_prompt = (
-            "你是意图路由器。"
-            "用户消息只分类为 A/B/C："
-            "A=提交采购申请，B=查询信息（供应商/订单/日志），C=闲聊。"
-            "仅输出 A 或 B 或 C。"
+            "你是意图路由器，只输出一个字母 A/B/C。\n"
+            "A：用户**明确在提交采购/物料需求**（要买什么、数量预算交期、请帮忙下单等）。\n"
+            "B：用户要**查库**（查供应商、订单、日志、统计、列出记录等）。\n"
+            "C：**其余全部**归为 C——包括闲聊、常识、翻译、写短文/邮件、"
+            "**写代码/脚本**、数学计算、与采购无关的技术问题等；不要只因「和采购无关」就强行归 A。\n"
+            "仅输出 A 或 B 或 C，不要解释。"
         )
-        prompt = f'用户说："{text}"\n请判断意图并只返回 A/B/C。'
+        prompt = f'用户说："{text}"\n只返回 A/B/C。'
         raw = self.planner._call_llm(prompt, system_prompt).strip()
         normalized = raw.replace('"', "").replace("'", "").strip().upper()
         if normalized in {"A", "B", "C"}:
             return normalized
 
-        # 兜底：关键词规则
-        procurement_keywords = ("采购", "买", "下单", "预算", "交期", "供应商", "数量", "物料")
-        if any(k in text for k in procurement_keywords):
-            return "A"
-        command_keywords = ("查询", "列出", "查看", "统计", "订单", "供应商")
+        # 兜底：关键词规则（宁 C 勿错 A，避免把写代码/闲聊误判成采购申请）
+        tech_general = ("python", "脚本", "代码", "编程", "函数", "import ", "def ", "javascript", "java", "sql")
+        tl = text.lower()
+        if any(k in text for k in ("写一段", "写一个", "生成代码", "示例代码")) or any(
+            k in tl for k in tech_general
+        ):
+            return "C"
+        command_keywords = ("查询", "列出", "查看", "统计", "订单", "供应商", "日志")
         if any(k in text for k in command_keywords):
             return "B"
+        procurement_keywords = ("采购", "买", "下单", "预算", "交期", "供应商", "数量", "物料", "询价", "招标")
+        if any(k in text for k in procurement_keywords):
+            return "A"
         return "C"
 
     def _extract_query(self, user_text: str) -> Dict[str, Any]:
@@ -236,6 +244,13 @@ class BotHandler:
 
         raise ValueError(f'未找到编号为「{key}」的采购需求，请核对单号后重试。')
 
+    def _im_delivery_kwargs(self, im_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """飞书会话 chat_id：群聊为群 ID，单聊为二人会话 ID；用于审批卡片与机器人回复同源投递。"""
+        chat = str((im_context or {}).get("chat_id") or "").strip()
+        if chat:
+            return {"im_receive_id": chat, "im_receive_id_type": "chat_id"}
+        return {}
+
     def _procurement_intent_reply(self, result: Dict[str, Any]) -> str:
         """采购申请（意图 A）成功后的 IM 正文：业务列表摘要 + 流程说明，避免底层实现术语。"""
         dcode = str(result.get("demand_code") or "").strip()
@@ -373,8 +388,25 @@ class BotHandler:
                     ref,
                     record_id,
                 )
-                _update_fields, _ = self.auditor.run_audit_debate(record_id)
+                _update_fields, _st, skip_reason = self.auditor.run_audit_debate(
+                    record_id, **self._im_delivery_kwargs(im_context)
+                )
                 code = str(fld.get(self.settings.demand_field_demand_code) or "").strip() or ref
+                if skip_reason == "no_candidate_suppliers":
+                    return {
+                        "reply": (
+                            f"单号 **{code}**：当前**没有可用的候选供应商**，AI 审计官无法启动 QCDSR 比价。\n"
+                            "请在需求中**关联推荐供应商**，或调整**品类**与供应商表中**主营业务**标签一致后，再发「触发审批」。"
+                            "（系统已在需求备注中留下说明。）"
+                        )
+                    }
+                if skip_reason == "debate_aborted_no_supplier":
+                    return {
+                        "reply": (
+                            f"单号 **{code}**：比价流程异常结束，**未能确定供应商**。\n"
+                            "请检查候选供应商数据或在表中人工指定推荐后，再试「触发审批」。"
+                        )
+                    }
                 pending_hint = (
                     "主管 → 采购对接 → 运输确认 → 生成订单"
                     if self.settings.multi_stage_approval
@@ -419,14 +451,21 @@ class BotHandler:
                 return {"reply": f"我当前调用的模型是：{self.settings.llm_model}。"}
 
             system_prompt = (
-                "你是采购智能助手。请用中文简洁回答用户问题，1-2句话。"
-                "如果用户问题与采购流程相关，可顺带提示你能做需求录入、供应商协同、订单跟踪。"
+                "你部署在飞书里的企业助手，**默认熟悉采购**，但应对用户保持友好、专业，**不要拒绝**与采购无关的合理请求。\n"
+                "- 用户要写代码/脚本、算题、翻译、常识问答等：正常作答，代码可用 markdown 代码块，保持简洁可运行。\n"
+                "- 用户问采购：可说明支持需求录入、供应商协同、订单跟踪、触发审批等。\n"
+                "- 禁止再说「只支持采购、不支持 Python」这类生硬拒答；最多在回答末尾用一句话轻量提醒采购能力即可。\n"
+                "使用中文为主。"
             )
-            prompt = f"用户问题：{user_text}"
-            answer = self.planner._call_llm(prompt, system_prompt).strip()
+            prompt = f"用户消息：{user_text}"
+            answer = self.planner._call_llm(
+                prompt,
+                system_prompt,
+                max_tokens=min(4096, max(1024, len(user_text) * 2 + 512)),
+            ).strip()
             if not answer:
-                answer = "我可以帮你做采购需求录入、供应商协同和订单跟踪。"
-            return {"reply": answer[:300]}
+                answer = "我在呢。你可以发采购需求、查供应商/订单，或继续问我别的问题。"
+            return {"reply": answer[:8000]}
 
         return {"reply": "我暂时无法识别你的意图，请尝试描述采购需求或查询对象。"}
 

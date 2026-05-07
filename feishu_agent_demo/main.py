@@ -134,7 +134,8 @@ class AgentOrchestrator:
         else:
             logger.info("Planner: 本 tick 成功更新 %s 条需求", planner_ok)
 
-        # 2) 待辩论 -> 自动 run_audit_debate（与 IM「触发审批」等价；每 tick 最多 1 条，避免 LLM/飞书堆积）
+        # 2) 待辩论 -> 自动 run_audit_debate（与 IM「触发审批」等价）
+        #    同 tick 内可尝试多条：若首条因「无候选供应商」等阻塞，继续尝试队列后续，避免永远卡在第一条。
         if self.settings.auto_run_audit_debate:
             debate_queue = self._list_by_filter(
                 TABLE_IDS["demands"],
@@ -147,15 +148,38 @@ class AgentOrchestrator:
                 max_pages=5,
             )
             if debate_queue:
-                first = debate_queue[0]
-                rid = str(first.get("record_id", "") or "")
-                if rid:
+                max_try = min(len(debate_queue), 10)
+                progressed = False
+                for i in range(max_try):
+                    rid = str(debate_queue[i].get("record_id", "") or "").strip()
+                    if not rid:
+                        continue
                     try:
-                        logger.info("Auditor: 自动辩论与挂起待审批 record_id=%s", rid)
-                        self.auditor.run_audit_debate(rid)
+                        logger.info(
+                            "Auditor: 自动辩论与挂起待审批 record_id=%s（本 tick 第 %s/%s 条）",
+                            rid,
+                            i + 1,
+                            max_try,
+                        )
+                        _uf, _st, skip_reason = self.auditor.run_audit_debate(rid)
+                        if skip_reason in ("no_candidate_suppliers", "debate_aborted_no_supplier"):
+                            logger.info(
+                                "Auditor: %s 阻塞原因=%s，已写需求备注/尝试发 IM；继续尝试下一条待辩论",
+                                rid,
+                                skip_reason,
+                            )
+                            continue
+                        progressed = True
+                        break
                     except Exception as exc:
                         logger.error("自动 run_audit_debate 失败: %s", exc)
                         logger.error(traceback.format_exc())
+                        break
+                if not progressed and debate_queue:
+                    logger.info(
+                        "Auditor: 本 tick 在待辩论队列前 %s 条中无成功推进（常见：均无匹配供应商）",
+                        max_try,
+                    )
             else:
                 logger.info("Auditor: 无「待辩论」需求，跳过自动辩论")
 

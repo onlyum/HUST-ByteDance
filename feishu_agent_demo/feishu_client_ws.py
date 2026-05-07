@@ -128,19 +128,27 @@ class FeishuWebSocketClient:
         except Exception:
             return ""
 
-    def _extract_reply_target(self, data: Any) -> tuple[Optional[str], Optional[str]]:
-        """尽量提取回复对象：优先私聊用户 open_id，其次 chat_id。"""
-        open_id: Optional[str] = None
-        chat_id: Optional[str] = None
+    def _resolve_im_receive_target(self, data: Any) -> tuple[str, str]:
+        """
+        解析发消息 API 的 receive_id / receive_id_type。
+        优先使用会话 chat_id：群聊为群 ID，单聊为与该用户的会话 ID，机器人回复会回到原会话（群内 @ 不会误发到私聊）。
+        仅当 chat_id 缺失时回退为发送者 open_id。
+        """
+        chat_id = ""
+        open_id = ""
         try:
-            open_id = data.event.sender.sender_id.open_id
+            chat_id = str(data.event.message.chat_id or "").strip()
         except Exception:
-            open_id = None
+            chat_id = ""
         try:
-            chat_id = data.event.message.chat_id
+            open_id = str(data.event.sender.sender_id.open_id or "").strip()
         except Exception:
-            chat_id = None
-        return open_id, chat_id
+            open_id = ""
+        if chat_id:
+            return "chat_id", chat_id
+        if open_id:
+            return "open_id", open_id
+        return "", ""
 
     def _send_message(self, *, receive_id_type: str, receive_id: str, msg_type: str, content_obj: dict[str, Any]) -> None:
         req_body = (
@@ -224,15 +232,9 @@ class FeishuWebSocketClient:
             return
         self._recent_fingerprints[fingerprint] = time.time()
 
-        open_id, chat_id = self._extract_reply_target(data)
-        receive_id_type: Optional[str] = None
-        receive_id: Optional[str] = None
-        if open_id:
-            receive_id_type, receive_id = "open_id", str(open_id)
-        elif chat_id:
-            receive_id_type, receive_id = "chat_id", str(chat_id)
+        receive_id_type, receive_id = self._resolve_im_receive_target(data)
         if not receive_id_type or not receive_id:
-            logger.warning("IM 事件无可用 receive_id（open_id/chat_id），跳过回复")
+            logger.warning("IM 事件无可用 receive_id（chat_id/open_id），跳过回复")
             return
 
         im_ctx: dict[str, Any] = {
@@ -416,13 +418,27 @@ class FeishuWebSocketClient:
             self._processed_approvals.pop(dedupe_key, None)
             logger.warning("卡片审批后台任务失败: %s", exc)
             notify = f"审批落库失败：{exc}"
-        if (operator_open_id or "").strip() and notify:
+        if not (notify or "").strip():
+            return
+        text = notify[:3500]
+        # 审批人私聊确认 + 关联群/会话进度同步（依赖 Interaction_Memory.chat_id；单聊场景可能与私聊重复一条，可忽略）
+        if (operator_open_id or "").strip():
             self._send_message(
                 receive_id_type="open_id",
                 receive_id=operator_open_id.strip(),
                 msg_type="text",
-                content_obj={"text": notify[:3500]},
+                content_obj={"text": text},
             )
+        chat_for_notify = (self._auditor.get_im_chat_id_for_demand(demand_id) or "").strip()
+        if chat_for_notify:
+            self._send_message(
+                receive_id_type="chat_id",
+                receive_id=chat_for_notify,
+                msg_type="text",
+                content_obj={"text": text},
+            )
+        elif not (operator_open_id or "").strip():
+            logger.info("审批结果无 IM 投递目标：操作人 open_id 与会话 chat_id 均为空")
 
     def _on_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         """

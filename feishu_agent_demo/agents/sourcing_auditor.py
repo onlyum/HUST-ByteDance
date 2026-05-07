@@ -27,6 +27,9 @@ class SourcingAuditorAgent(BaseAgent):
     DEBATE_FALLBACK_AUDIT_NOTE = (
         "由于审计系统繁忙，已通过基础信用算法完成初选，请人工加强复核。"
     )
+    # 写入 Demands.notes，避免编排器每 tick 重复发 IM
+    NO_CANDIDATE_SUPPLIER_MARKER = "【寻源阻塞-已提示】"
+    DEBATE_ABORT_NO_SUPPLIER_MARKER = "【比价异常-已提示】"
 
     def __init__(self, agent_id: str, settings: ProcurementSettings, bitable: FeishuBitableToolbox) -> None:
         super().__init__(agent_id, settings, bitable)
@@ -37,6 +40,130 @@ class SourcingAuditorAgent(BaseAgent):
             .log_level(lark.LogLevel.INFO)
             .build()
         )
+
+    def get_im_chat_id_for_demand(self, demand_record_id: str) -> str:
+        """
+        从 Interaction_Memory 取该需求最近一次 IM 上下文的 chat_id。
+        群聊与单聊在飞书中均有 chat_id，发消息时使用 receive_id_type=chat_id 即可回到同一会话。
+        """
+        tid = str(TABLE_IDS.get("interaction_memory") or "").strip()
+        if not tid or not (demand_record_id or "").strip():
+            return ""
+        did = demand_record_id.strip()
+        best_ts = -1
+        best_chat = ""
+        for rec in self.bitable.iter_records(
+            app_token=self.settings.bitable_app_token,
+            table_id=tid,
+            fields=["related_record_id", "chat_id", "last_interaction"],
+            max_pages=15,
+        ):
+            fields = rec.get("fields") if isinstance(rec.get("fields"), dict) else {}
+            if not isinstance(fields, dict):
+                continue
+            if str(fields.get("related_record_id") or "").strip() != did:
+                continue
+            cid = str(fields.get("chat_id") or "").strip()
+            if not cid:
+                continue
+            raw_ts = fields.get("last_interaction")
+            ts = 0
+            try:
+                if isinstance(raw_ts, (int, float)):
+                    ts = int(raw_ts)
+                elif isinstance(raw_ts, str) and raw_ts.strip().isdigit():
+                    ts = int(raw_ts.strip())
+            except Exception:
+                ts = 0
+            if ts >= best_ts:
+                best_ts = ts
+                best_chat = cid
+        return best_chat
+
+    @staticmethod
+    def _resolve_session_notify_target(
+        im_receive_id: Optional[str],
+        im_receive_id_type: Optional[str],
+        memory_chat_id: Optional[str],
+    ) -> Tuple[str, str]:
+        """
+        会话内说明类消息（如「无候选供应商」）：优先本条 IM 的会话，其次 Interaction_Memory 中的 chat_id。
+        """
+        explicit_id = (im_receive_id or "").strip()
+        explicit_type = (im_receive_id_type or "").strip().lower()
+        if explicit_id and explicit_type in ("chat_id", "open_id"):
+            return explicit_id, explicit_type
+        mem = (memory_chat_id or "").strip()
+        if mem:
+            return mem, "chat_id"
+        return "", ""
+
+    def _resolve_approval_card_delivery_target(
+        self,
+        personnel_open_id: str,
+        memory_chat_id: Optional[str],
+    ) -> Tuple[str, str]:
+        """
+        审批交互卡片：必须优先发给环节负责人（私聊 open_id）；仅当未配置审批人时，才用会话 chat_id 兜底（避免静默失败）。
+        """
+        oid = (personnel_open_id or "").strip()
+        if oid:
+            return oid, "open_id"
+        mock = (self.settings.mock_personnel_feishu_open_id or "").strip()
+        if mock:
+            return mock, "open_id"
+        mem = (memory_chat_id or "").strip()
+        if mem:
+            self.logger.warning(
+                "审批人 open_id 未配置，审批卡片发往会话 chat_id（兜底），建议配置 Personnel 或 MOCK_PERSONNEL_FEISHU_OPEN_ID"
+            )
+            return mem, "chat_id"
+        return "", ""
+
+    def _append_demand_note_line(self, demand_record_id: str, line: str, *, max_len: int = 1200) -> None:
+        try:
+            dem = self.bitable.get_record(
+                app_token=self.settings.bitable_app_token,
+                table_id=TABLE_IDS["demands"],
+                record_id=demand_record_id,
+            )
+            fld = dem.get("fields") if isinstance(dem, dict) else {}
+            if not isinstance(fld, dict):
+                fld = {}
+            prev = str(fld.get("notes") or "").strip()
+            if line in prev:
+                return
+            merged = (prev + ("\n" if prev else "") + line)[-max_len:]
+            self.bitable.update_record(
+                app_token=self.settings.bitable_app_token,
+                table_id=TABLE_IDS["demands"],
+                record_id=demand_record_id,
+                fields={"notes": merged},
+            )
+        except Exception as exc:
+            self.logger.warning("写入需求备注失败 demand=%s: %s", demand_record_id, exc)
+
+    def _notify_im_debate_hint(
+        self,
+        demand_record_id: str,
+        text: str,
+        *,
+        im_receive_id: Optional[str] = None,
+        im_receive_id_type: Optional[str] = None,
+    ) -> None:
+        """在会话（群/单聊）中发一条说明；依赖 chat_id 或 Interaction_Memory。"""
+        mem = self.get_im_chat_id_for_demand(demand_record_id)
+        recv_id, recv_type = self._resolve_session_notify_target(
+            im_receive_id,
+            im_receive_id_type,
+            mem,
+        )
+        if not recv_id:
+            self.logger.info("无 IM 投递目标，跳过寻源提示 IM: demand=%s", demand_record_id)
+            return
+        ok = self._send_im_text(receive_id=recv_id, receive_id_type=recv_type, text=text[:3500])
+        if ok:
+            self.logger.info("已发送寻源/比价提示 IM（%s）", recv_type)
 
     @staticmethod
     def _single_select_text(val: Any) -> str:
@@ -376,18 +503,28 @@ class SourcingAuditorAgent(BaseAgent):
             lines.append(f"- （读取供应商档案失败：{exc}）")
         return "\n".join(lines)
 
-    def _send_interactive_card(self, *, open_id: str, card: Dict[str, Any]) -> bool:
+    def _send_interactive_card(
+        self,
+        *,
+        receive_id: str,
+        receive_id_type: str,
+        card: Dict[str, Any],
+    ) -> bool:
+        rid = (receive_id or "").strip()
+        rtype = (receive_id_type or "").strip().lower()
+        if not rid or rtype not in ("open_id", "chat_id"):
+            return False
         try:
             req_body = (
                 lark.im.v1.CreateMessageRequestBody.builder()
-                .receive_id(open_id)
+                .receive_id(rid)
                 .msg_type("interactive")
                 .content(json.dumps(card, ensure_ascii=False))
                 .build()
             )
             req = (
                 lark.im.v1.CreateMessageRequest.builder()
-                .receive_id_type("open_id")
+                .receive_id_type(rtype)
                 .request_body(req_body)
                 .build()
             )
@@ -395,10 +532,11 @@ class SourcingAuditorAgent(BaseAgent):
             if not resp.success():
                 raw = getattr(resp, "raw", None)
                 self.logger.warning(
-                    "审批卡片发送失败: code=%s msg=%s raw=%s（检查机器人 IM 权限、接收人 open_id、是否可发 interactive）",
+                    "审批卡片发送失败: code=%s msg=%s raw=%s（检查机器人 IM 权限、receive_id_type=%s、是否可发 interactive）",
                     resp.code,
                     resp.msg,
                     raw,
+                    rtype,
                 )
                 return False
             return True
@@ -406,21 +544,22 @@ class SourcingAuditorAgent(BaseAgent):
             self.logger.warning("审批卡片 IM 请求异常（不中断主流程）: %s", exc)
             return False
 
-    def _send_im_text_to_open_id(self, *, open_id: str, text: str) -> bool:
-        oid = (open_id or "").strip()
-        if not oid:
+    def _send_im_text(self, *, receive_id: str, receive_id_type: str, text: str) -> bool:
+        rid = (receive_id or "").strip()
+        rtype = (receive_id_type or "").strip().lower()
+        if not rid or rtype not in ("open_id", "chat_id"):
             return False
         try:
             req_body = (
                 lark.im.v1.CreateMessageRequestBody.builder()
-                .receive_id(oid)
+                .receive_id(rid)
                 .msg_type("text")
                 .content(json.dumps({"text": text[:4000]}, ensure_ascii=False))
                 .build()
             )
             req = (
                 lark.im.v1.CreateMessageRequest.builder()
-                .receive_id_type("open_id")
+                .receive_id_type(rtype)
                 .request_body(req_body)
                 .build()
             )
@@ -445,14 +584,23 @@ class SourcingAuditorAgent(BaseAgent):
         debate_decision: Dict[str, Any],
         *,
         phase: str = "legacy",
+        receive_id: Optional[str] = None,
+        receive_id_type: Optional[str] = None,
     ) -> Tuple[bool, bool]:
         """
         推送审批 interactive 卡片；失败则短暂重试，仍失败则发纯文本兜底。
+        receive_id / receive_id_type：显式指定则优先（通常为 chat_id 群/单聊会话）；否则使用 open_id（Personnel）。
         返回: (卡片是否成功, 是否至少发出了文本兜底)
         """
         oid = (open_id or "").strip()
-        if not oid:
-            self.logger.warning("_push_approval_card: open_id 为空，跳过发送")
+        explicit_r = (receive_id or "").strip()
+        explicit_t = (receive_id_type or "").strip().lower()
+        if explicit_r and explicit_t in ("chat_id", "open_id"):
+            target_id, target_type = explicit_r, explicit_t
+        elif oid:
+            target_id, target_type = oid, "open_id"
+        else:
+            self.logger.warning("_push_approval_card: 无有效接收方（open_id / receive_id）")
             return False, False
 
         demand_record_id = str(demand_record.get("record_id") or "")
@@ -478,7 +626,11 @@ class SourcingAuditorAgent(BaseAgent):
 
         if card is not None:
             for attempt in range(3):
-                if self._send_interactive_card(open_id=oid, card=card):
+                if self._send_interactive_card(
+                    receive_id=target_id,
+                    receive_id_type=target_type,
+                    card=card,
+                ):
                     return True, False
                 if attempt < 2:
                     time.sleep(1.2)
@@ -490,14 +642,14 @@ class SourcingAuditorAgent(BaseAgent):
             f"推荐供应商：{supplier_name}（supplier_id={chosen_supplier_id}）\n"
             f"摘要：{reason[:400]}\n"
             "——\n"
-            "排查：审批人是否已向本机器人发起过私聊；开放平台是否开通机器人发消息；"
-            "日志中 interactive 的 code/msg。"
+            "排查：群/会话是否允许机器人发言；私聊场景审批人是否已与机器人单聊；开放平台 IM 与 interactive 权限。"
         )
-        text_ok = self._send_im_text_to_open_id(open_id=oid, text=fallback)
+        text_ok = self._send_im_text(receive_id=target_id, receive_id_type=target_type, text=fallback)
         if text_ok:
             self.logger.warning(
-                "审批卡片未送达审批人 %s，已发送文本兜底（record_id=%s）",
-                oid,
+                "审批卡片未送达会话 %s（%s），已发送文本兜底（demand=%s）",
+                target_id[:24],
+                target_type,
                 demand_record_id,
             )
         return False, text_ok
@@ -829,7 +981,7 @@ class SourcingAuditorAgent(BaseAgent):
         return demand_record_for_card, debate_decision, category
 
     def push_next_approval_card(self, demand_record_id: str) -> Tuple[bool, bool]:
-        """按需求当前 status 向本环节负责人推送卡片（上一环节通过后由 WS 调用）。"""
+        """按需求当前 status 向本环节负责人推送卡片（私聊 open_id；上一环节通过后由 WS 调用）。"""
         demand = self.bitable.get_record(
             app_token=self.settings.bitable_app_token,
             table_id=TABLE_IDS["demands"],
@@ -844,29 +996,43 @@ class SourcingAuditorAgent(BaseAgent):
             self.logger.warning("push_next_approval_card: 无推荐供应商 demand=%s", demand_record_id)
             return False, False
         demand_record_for_card, debate_decision, category = snap
+        mem_chat = self.get_im_chat_id_for_demand(demand_record_id)
+
+        def _push(oid: str, phase: str) -> Tuple[bool, bool]:
+            recv_id, recv_type = self._resolve_approval_card_delivery_target(oid, mem_chat)
+            if not recv_id:
+                return False, False
+            return self._push_approval_card(
+                oid,
+                demand_record_for_card,
+                debate_decision,
+                phase=phase,
+                receive_id=recv_id,
+                receive_id_type=recv_type,
+            )
 
         if not self.settings.multi_stage_approval:
             oid = self._get_approver_open_id(category)
-            return self._push_approval_card(oid, demand_record_for_card, debate_decision, phase="legacy")
+            return _push(oid, "legacy")
 
         if st == BusinessStatus.DEMAND_PENDING_APPROVAL_SUPERVISOR:
             oid = self._get_personnel_open_id_by_phase(category, "supervisor")
-            return self._push_approval_card(oid, demand_record_for_card, debate_decision, phase="supervisor")
+            return _push(oid, "supervisor")
         if st in (BusinessStatus.DEMAND_PENDING_PURCHASE_CONFIRM, "待下单确认"):
             oid = self._get_personnel_open_id_by_phase(category, "purchaser")
-            return self._push_approval_card(oid, demand_record_for_card, debate_decision, phase="purchaser")
+            return _push(oid, "purchaser")
         if st == BusinessStatus.DEMAND_PENDING_APPROVAL_LOGISTICS:
             oid = self._get_personnel_open_id_by_phase(category, "logistics")
-            return self._push_approval_card(oid, demand_record_for_card, debate_decision, phase="logistics")
+            return _push(oid, "logistics")
         if st == BusinessStatus.DEMAND_PENDING_APPROVAL:
             oid = self._get_approver_open_id(category)
-            return self._push_approval_card(oid, demand_record_for_card, debate_decision, phase="legacy")
+            return _push(oid, "legacy")
 
         self.logger.info("push_next_approval_card: 状态 %s 不需要发卡片", st)
         return False, False
 
     def resend_approval_card(self, demand_record_id: str) -> Tuple[bool, str]:
-        """在审批链各等待节点重发当前环节卡片，不重新跑辩论。"""
+        """在审批链各等待节点重发当前环节卡片（私聊审批人），不重新跑辩论。"""
         demand = self.bitable.get_record(
             app_token=self.settings.bitable_app_token,
             table_id=TABLE_IDS["demands"],
@@ -897,6 +1063,7 @@ class SourcingAuditorAgent(BaseAgent):
                 "请在多维表格 Demands 中检查推荐供应商字段后重试。"
             )
         demand_record_for_card, debate_decision, category = snap
+        mem_chat = self.get_im_chat_id_for_demand(demand_record_id)
 
         if self.settings.multi_stage_approval:
             if current_status == BusinessStatus.DEMAND_PENDING_APPROVAL_SUPERVISOR:
@@ -910,14 +1077,20 @@ class SourcingAuditorAgent(BaseAgent):
         else:
             oid, phase = self._get_approver_open_id(category), "legacy"
 
-        if not oid:
+        recv_id, recv_type = self._resolve_approval_card_delivery_target(oid, mem_chat)
+        if not recv_id:
             return False, (
-                "未配置该环节联系人飞书 open_id（Personnel 无匹配且 MOCK_PERSONNEL_FEISHU_OPEN_ID 为空）。"
-                "配置后再发送「触发审批」即可重发卡片。"
+                "未配置该环节联系人飞书 open_id（Personnel 无匹配且 MOCK_PERSONNEL_FEISHU_OPEN_ID 为空），"
+                "且无会话 chat_id 可用于兜底。请配置审批人后再试。"
             )
 
         card_ok, text_ok = self._push_approval_card(
-            oid, demand_record_for_card, debate_decision, phase=phase
+            oid,
+            demand_record_for_card,
+            debate_decision,
+            phase=phase,
+            receive_id=recv_id,
+            receive_id_type=recv_type,
         )
         if card_ok:
             return True, "已重发当前环节审批卡片。"
@@ -931,11 +1104,18 @@ class SourcingAuditorAgent(BaseAgent):
             "常见原因：机器人缺 IM 权限、审批人需先与机器人单聊、或 interactive 被租户策略拦截。"
         )
 
-    def run_audit_debate(self, demand_record_id: str) -> Tuple[Dict[str, Any], str]:
+    def run_audit_debate(
+        self,
+        demand_record_id: str,
+        *,
+        im_receive_id: Optional[str] = None,
+        im_receive_id_type: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], str, Optional[str]]:
         """
         驱动 LLM 模拟「成本官 vs 质量官」辩论并落库；不自动下单。
         - Debate_History（优先）/ Audit_Logs（回退）
-        - Demands：状态=待审批，写推荐供应商与辩论摘要；向 Personnel 匹配的主管推送飞书审批卡片。
+        - Demands：状态=待审批，写推荐供应商与辩论摘要；向会话 chat_id（若可得）或 Personnel open_id 推送审批卡片。
+        返回第三项 skip_reason：无候选供应商等阻塞时为 \"no_candidate_suppliers\" / \"debate_aborted_no_supplier\"，成功为 None。
         """
         self.logger.info("开始辩论审计: demand_record_id=%s", demand_record_id)
 
@@ -985,7 +1165,39 @@ class SourcingAuditorAgent(BaseAgent):
                 detail={"demand_record_id": demand_record_id},
                 demand_record_id=demand_record_id,
             )
-            return {}, BusinessStatus.DEMAND_PENDING_DEBATE
+            dcode = str(demand_fields.get(self.settings.demand_field_demand_code, "") or "").strip()
+            cat_hint = str(demand_fields.get(self.settings.demand_field_category, "") or "").strip()
+            try:
+                dem = self.bitable.get_record(
+                    app_token=self.settings.bitable_app_token,
+                    table_id=TABLE_IDS["demands"],
+                    record_id=demand_record_id,
+                )
+                prev_notes = str((dem.get("fields") or {}).get("notes") or "") if isinstance(dem.get("fields"), dict) else ""
+            except Exception:
+                prev_notes = ""
+            if self.NO_CANDIDATE_SUPPLIER_MARKER not in prev_notes:
+                now_s = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+                cat_part = f"当前品类为「{cat_hint}」。" if cat_hint else "当前未填写有效品类或品类与供应商「主营业务」不一致。"
+                note_line = (
+                    f"{self.NO_CANDIDATE_SUPPLIER_MARKER} [{now_s}] "
+                    "AI 审计官无法启动 QCDSR 比价：供应商库中无匹配候选。"
+                    f"{cat_part}"
+                    "请在需求中关联「推荐供应商」，或调整供应商档案中的主营业务标签后重试。"
+                )
+                self._append_demand_note_line(demand_record_id, note_line)
+                im_body = (
+                    f"单号 **{dcode or '（待查表）'}**：未在供应商库中匹配到候选，**无法启动 AI 审计官比价**。\n"
+                    f"{cat_part}\n"
+                    "请在多维表格为该需求**关联推荐供应商**，或调整**品类**与 **Suppliers 主营业务** 一致后，再发「触发审批」。"
+                )
+                self._notify_im_debate_hint(
+                    demand_record_id,
+                    im_body,
+                    im_receive_id=im_receive_id,
+                    im_receive_id_type=im_receive_id_type,
+                )
+            return {}, BusinessStatus.DEMAND_PENDING_DEBATE, "no_candidate_suppliers"
 
         supplier_rows: List[Dict[str, Any]] = []
         for sid in candidate_ids:
@@ -1156,7 +1368,34 @@ class SourcingAuditorAgent(BaseAgent):
                 detail={"candidate_count": len(candidate_ids)},
                 demand_record_id=demand_record_id,
             )
-            return {}, BusinessStatus.DEMAND_PENDING_DEBATE
+            dcode = str(demand_fields.get(self.settings.demand_field_demand_code, "") or "").strip()
+            try:
+                dem = self.bitable.get_record(
+                    app_token=self.settings.bitable_app_token,
+                    table_id=TABLE_IDS["demands"],
+                    record_id=demand_record_id,
+                )
+                prev_notes = str((dem.get("fields") or {}).get("notes") or "") if isinstance(dem.get("fields"), dict) else ""
+            except Exception:
+                prev_notes = ""
+            if self.DEBATE_ABORT_NO_SUPPLIER_MARKER not in prev_notes:
+                now_s = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+                note_line = (
+                    f"{self.DEBATE_ABORT_NO_SUPPLIER_MARKER} [{now_s}] "
+                    "辩论与降级选型后仍无法确定供应商，请检查候选数据或人工指定推荐供应商。"
+                )
+                self._append_demand_note_line(demand_record_id, note_line)
+                im_body = (
+                    f"单号 **{dcode or '（待查表）'}**：AI 审计官比价后**仍无法确定供应商**，流程已暂停在「待辩论」。\n"
+                    "请检查供应商档案与推荐关联，或联系管理员处理。"
+                )
+                self._notify_im_debate_hint(
+                    demand_record_id,
+                    im_body,
+                    im_receive_id=im_receive_id,
+                    im_receive_id_type=im_receive_id_type,
+                )
+            return {}, BusinessStatus.DEMAND_PENDING_DEBATE, "debate_aborted_no_supplier"
 
         if not debate_logs:
             debate_logs = [
@@ -1257,8 +1496,13 @@ class SourcingAuditorAgent(BaseAgent):
             chosen_id,
         )
 
-        # 5) 匹配审批人并推送飞书审批卡片（首环节）
-        approver_open_id = self._get_approver_open_id(category)
+        # 5) 匹配审批人并推送飞书审批卡片（首环节）——发往审批人私聊；未配置时才用会话 chat_id 兜底
+        if self.settings.multi_stage_approval:
+            approver_open_id = self._get_personnel_open_id_by_phase(category, "supervisor")
+        else:
+            approver_open_id = self._get_approver_open_id(category)
+        mem_chat = self.get_im_chat_id_for_demand(demand_record_id)
+        recv_id, recv_type = self._resolve_approval_card_delivery_target(approver_open_id, mem_chat)
         demand_record_for_card: Dict[str, Any] = {"record_id": demand_record_id, "fields": demand_fields}
         debate_decision: Dict[str, Any] = {
             "supplier_name": chosen_name,
@@ -1267,31 +1511,47 @@ class SourcingAuditorAgent(BaseAgent):
         }
         card_sent = False
         text_fallback_sent = False
-        if approver_open_id:
+        if recv_id:
             self.logger.info(
-                "待审批推送: 审批人 open_id=%s（请与飞书「私信发送者 open_id」或 Personnel 核对是否为收卡人）",
-                approver_open_id,
+                "待审批推送: receive_id_type=%s target=%s… personnel_open_id=%s",
+                recv_type,
+                recv_id[:20],
+                (approver_open_id or "")[:16],
             )
             card_sent, text_fallback_sent = self._push_approval_card(
-                approver_open_id, demand_record_for_card, debate_decision, phase=card_phase
+                approver_open_id,
+                demand_record_for_card,
+                debate_decision,
+                phase=card_phase,
+                receive_id=recv_id,
+                receive_id_type=recv_type,
             )
             if card_sent:
-                self.logger.info("✅ 已将需求 %s 挂起，并推送给主管 %s 审批（卡片）", demand_record_id, approver_open_id)
+                self.logger.info(
+                    "✅ 已将需求 %s 挂起，并已推送审批卡片（%s）",
+                    demand_record_id,
+                    recv_type,
+                )
                 self.log_to_audit_table(
                     action="recommend",
                     target_table="Demands",
                     target_record_id=demand_record_id,
                     result="success",
-                    message=f"Sent approval card to approver {approver_open_id}",
-                    detail={"approver_open_id": approver_open_id, "category": category},
+                    message=f"Sent approval card via {recv_type}",
+                    detail={
+                        "approver_open_id": approver_open_id,
+                        "delivery_receive_id_prefix": recv_id[:24],
+                        "delivery_receive_id_type": recv_type,
+                        "category": category,
+                    },
                     demand_record_id=demand_record_id,
                     supplier_record_id=chosen_id or None,
                 )
             elif text_fallback_sent:
                 self.logger.warning(
-                    "需求 %s 已挂起待审批：卡片未送达，已向审批人 %s 发送文本兜底",
+                    "需求 %s 已挂起待审批：卡片未送达，已发文本兜底（%s）",
                     demand_record_id,
-                    approver_open_id,
+                    recv_type,
                 )
             else:
                 self.logger.warning(
@@ -1300,7 +1560,7 @@ class SourcingAuditorAgent(BaseAgent):
                 )
         else:
             self.logger.warning(
-                "需求 %s 已挂起为待审批，但未配置有效审批人 open_id（Personnel 与 MOCK_PERSONNEL_FEISHU_OPEN_ID 均为空），未推送卡片",
+                "需求 %s 已挂起为待审批，但无可用投递目标（Personnel/MOCK 为空且无 Interaction_Memory.chat_id），未推送卡片",
                 demand_record_id,
             )
 
@@ -1323,5 +1583,5 @@ class SourcingAuditorAgent(BaseAgent):
             supplier_record_id=chosen_id or None,
         )
 
-        return update_fields, pending_status
+        return update_fields, pending_status, None
 
